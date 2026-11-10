@@ -142,6 +142,12 @@ fn get_json(url: &str, secs: u64) -> Option<(serde_json::Value, u32)> {
     Some((v, t.elapsed().as_millis() as u32))
 }
 
+// เซิร์ฟเวอร์บางตัวส่งตัวเลขมาเป็นข้อความ เช่น "2048" จึงรองรับทั้งสองแบบ
+fn num(v: &serde_json::Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
 fn decode_icon(b64: &str) -> Option<IconData> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
@@ -165,8 +171,8 @@ fn fetch_status(address: &str, want_icon: bool) -> Status {
                 Status {
                     online: true,
                     name: d["hostname"].as_str().unwrap_or("").to_string(),
-                    players: d["clients"].as_u64(),
-                    max: d["sv_maxclients"].as_u64(),
+                    players: num(&d["clients"]),
+                    max: num(&d["sv_maxclients"]),
                     ping: ms,
                     icon: None,
                 }
@@ -191,8 +197,8 @@ fn fetch_status(address: &str, want_icon: bool) -> Status {
         return Status {
             online: true,
             name: v["hostname"].as_str().unwrap_or("").to_string(),
-            players: v["clients"].as_u64(),
-            max: v["sv_maxclients"].as_u64(),
+            players: num(&v["clients"]),
+            max: num(&v["sv_maxclients"]),
             ping: ms,
             icon,
         };
