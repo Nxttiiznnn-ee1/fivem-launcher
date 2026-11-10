@@ -2,6 +2,8 @@ name: build-windows-exe
 on:
   workflow_dispatch:
   push:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: windows-latest
@@ -13,3 +15,15 @@ jobs:
         with:
           name: FiveMLauncher
           path: target/release/fivem-launcher.exe
+      - name: Read version from Cargo.toml
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: v${{ steps.ver.outputs.version }}
+          files: target/release/fivem-launcher.exe
