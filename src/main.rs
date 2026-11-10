@@ -268,35 +268,18 @@ fn fivem_exe() -> Option<PathBuf> {
     exe.exists().then_some(exe)
 }
 
-fn run_fivem(args: &[String]) -> bool {
-    let Some(exe) = fivem_exe() else {
-        return false;
-    };
-    let mut c = std::process::Command::new(&exe);
-    if let Some(dir) = exe.parent() {
-        c.current_dir(dir);
-    }
-    c.args(args).spawn().is_ok()
-}
-
+// เปิด FiveM ผ่านเชลล์ของ Windows (เหมือนดับเบิลคลิก) ไม่สั่งรันโปรแกรมตรงๆ
+// เพราะ FiveM จะแจ้ง "should be launched directly from the shell or a web browser"
 fn launch_fivem() {
-    if !run_fivem(&[]) {
-        open_url("fivem://");
+    match fivem_exe() {
+        Some(exe) => open_url(&exe.to_string_lossy()),
+        None => open_url("fivem://"),
     }
 }
 
-// เปิดเกมเข้าเซิร์ฟเวอร์ ถ้ามีเลข build จะส่ง -b<เลข> ให้ FiveM เปิดด้วย build นั้นตั้งแต่แรก
-// (ได้ผลเฉพาะตอนที่ FiveM ยังไม่ได้เปิดอยู่)
-fn connect_game(addr: &str, build: Option<&str>) {
-    let url = format!("fivem://connect/{addr}");
-    let valid =
-        build.filter(|b| (3..=5).contains(&b.len()) && b.chars().all(|c| c.is_ascii_digit()));
-    if let Some(b) = valid {
-        if run_fivem(&[format!("-b{b}"), url.clone()]) {
-            return;
-        }
-    }
-    open_url(&url);
+// เปิดเกมเข้าเซิร์ฟเวอร์ผ่านลิงก์ fivem://connect/ (วิธีมาตรฐานของ FiveM)
+fn connect_game(addr: &str) {
+    open_url(&format!("fivem://connect/{addr}"));
 }
 
 // ---------- ฟอนต์ / สไตล์ ----------
@@ -482,15 +465,6 @@ impl App {
         self.toast = Some((msg, Instant::now()));
     }
 
-    // เลข build ที่จะใช้: ที่ตั้งเองมาก่อน ถ้าไม่ได้ตั้งใช้ค่าที่ตรวจเจอจากเซิร์ฟเวอร์
-    fn effective_build(&self, s: &Server) -> Option<String> {
-        if !s.build.is_empty() {
-            Some(s.build.clone())
-        } else {
-            self.builds.get(&s.id).cloned()
-        }
-    }
-
     // ย้ายแถวไปตำแหน่งที่ปล่อยเมาส์ (y = ตำแหน่งแนวตั้งของเมาส์)
     fn reorder(&mut self, id: &str, y: f32) {
         let Some(from) = self.state.servers.iter().position(|s| s.id == id) else {
@@ -512,21 +486,17 @@ impl App {
             (
                 normalize(&s.address),
                 display_name(s, self.status.get(&s.id)),
-                self.effective_build(s),
             )
         });
-        let Some((addr, name, build)) = found else {
+        let Some((addr, name)) = found else {
             return;
         };
         match addr {
             Some(a) => {
-                connect_game(&a, build.as_deref());
+                connect_game(&a);
                 self.state.last = Some(id.to_string());
                 save_state(&self.state);
-                self.say(match &build {
-                    Some(b) => format!("กำลังเปิด FiveM (build {b}) → {name}"),
-                    None => format!("กำลังเปิด FiveM → {name}"),
-                });
+                self.say(format!("กำลังเปิด FiveM → {name}"));
             }
             None => self.say("ที่อยู่เซิร์ฟเวอร์ไม่ถูกต้อง".to_string()),
         }
@@ -919,12 +889,6 @@ impl eframe::App for App {
                     ui.add(egui::TextEdit::singleline(&mut ed.name).desired_width(340.0));
                     ui.label("IP:Port หรือ cfx.re/join/โค้ด");
                     ui.add(egui::TextEdit::singleline(&mut ed.address).desired_width(340.0));
-                    ui.label("Game build (ไม่บังคับ เว้นว่าง = ตรวจจากเซิร์ฟเวอร์อัตโนมัติ)");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut ed.build)
-                            .hint_text("เช่น 2944")
-                            .desired_width(340.0),
-                    );
                     if !ed.error.is_empty() {
                         ui.colored_label(RED, &ed.error);
                     }
