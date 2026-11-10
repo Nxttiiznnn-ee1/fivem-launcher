@@ -4,6 +4,7 @@
 use eframe::egui::{self, pos2, vec2, Align, Align2, Color32, Pos2, RichText, Sense, Stroke};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -12,6 +13,12 @@ use std::time::{Duration, Instant};
 // เพิ่มได้โดยใส่ที่อยู่ต่อท้ายในวงเล็บเหลี่ยม คั่นด้วยเครื่องหมายคอมมา
 const DEFAULT_SERVERS: &[&str] = &["89.38.101.183:30120"];
 const REFRESH_EVERY: Duration = Duration::from_secs(30);
+
+// ระบบอัปเดตตัวเอง: เช็คเวอร์ชันล่าสุดจาก GitHub Releases ของ repository นี้
+// (repository ต้องเป็น Public โปรแกรมจึงจะอ่านได้)
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const REPO: &str = "Nxttiiznnn-ee1/fivem-launcher";
+const ASSET: &str = "fivem-launcher.exe";
 
 const BG: Color32 = Color32::from_rgb(10, 12, 22);
 const ROW: Color32 = Color32::from_rgb(20, 23, 38);
@@ -250,11 +257,9 @@ fn fetch_status(address: &str, want_info: bool) -> Status {
 // ---------- เปิด FiveM ----------
 #[cfg(windows)]
 fn open_url(u: &str) {
-    use std::os::windows::process::CommandExt;
-    let _ = std::process::Command::new("rundll32")
-        .args(["url.dll,FileProtocolHandler", u])
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .spawn();
+    // ส่งให้ explorer.exe เป็นคนเปิด เพื่อให้ FiveM เห็นว่าถูกเรียกจากเชลล์ของ Windows
+    // (ไม่ใช่จากโปรแกรมอื่น) ซึ่งเป็นเงื่อนไขที่ FiveM ตรวจก่อนยอมเปิด
+    let _ = std::process::Command::new("explorer.exe").arg(u).spawn();
 }
 
 #[cfg(not(windows))]
@@ -280,6 +285,101 @@ fn launch_fivem() {
 // เปิดเกมเข้าเซิร์ฟเวอร์ผ่านลิงก์ fivem://connect/ (วิธีมาตรฐานของ FiveM)
 fn connect_game(addr: &str) {
     open_url(&format!("fivem://connect/{addr}"));
+}
+
+// ---------- อัปเดตตัวเอง ----------
+#[derive(Clone)]
+struct Update {
+    version: String,
+    url: String,
+    sha256: Option<String>,
+}
+
+enum UpdMsg {
+    Found(Update),
+    Failed(String),
+}
+
+fn parse_ver(s: &str) -> [u32; 3] {
+    let mut out = [0u32; 3];
+    for (i, p) in s.trim_start_matches('v').split('.').take(3).enumerate() {
+        out[i] = p.trim().parse().unwrap_or(0);
+    }
+    out
+}
+
+fn check_update() -> Option<Update> {
+    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    let (v, _) = get_json(&url, 6)?;
+    let tag = v["tag_name"].as_str()?;
+    if parse_ver(tag) <= parse_ver(VERSION) {
+        return None;
+    }
+    let asset = v["assets"]
+        .as_array()?
+        .iter()
+        .find(|a| a["name"].as_str() == Some(ASSET))?;
+    Some(Update {
+        version: tag.trim_start_matches('v').to_string(),
+        url: asset["browser_download_url"].as_str()?.to_string(),
+        sha256: asset["digest"]
+            .as_str()
+            .and_then(|d| d.strip_prefix("sha256:"))
+            .map(|d| d.to_lowercase()),
+    })
+}
+
+// โหลดไฟล์ใหม่ สลับแทนไฟล์ที่กำลังรัน (Windows เปลี่ยนชื่อไฟล์ที่กำลังรันได้) แล้วเปิดตัวใหม่
+fn apply_update(u: &Update) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    // รับเฉพาะไฟล์ที่มาจาก Releases ของ repository นี้เท่านั้น
+    if !u
+        .url
+        .starts_with(&format!("https://github.com/{REPO}/releases/download/"))
+    {
+        return Err("ที่อยู่ไฟล์อัปเดตไม่ถูกต้อง".into());
+    }
+    let cur = std::env::current_exe().map_err(|e| e.to_string())?;
+    let new = cur.with_extension("new");
+    let old = cur.with_extension("old");
+
+    let resp = ureq::get(&u.url)
+        .set("User-Agent", "FiveM-Launcher/1.0")
+        .timeout(Duration::from_secs(180))
+        .call()
+        .map_err(|e| format!("โหลดไฟล์ไม่สำเร็จ: {e}"))?;
+    let mut buf = Vec::new();
+    resp.into_reader()
+        .take(150 * 1024 * 1024)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("โหลดไฟล์ไม่สำเร็จ: {e}"))?;
+
+    // ตรวจว่าเป็นไฟล์ .exe จริง และตรงกับค่า SHA-256 ที่ GitHub ระบุ (ถ้ามี)
+    if buf.len() < 1_000_000 || !buf.starts_with(b"MZ") {
+        return Err("ไฟล์ที่โหลดมาไม่ใช่โปรแกรมที่ถูกต้อง".into());
+    }
+    if let Some(expected) = &u.sha256 {
+        let got = format!("{:x}", Sha256::digest(&buf));
+        if &got != expected {
+            return Err("ค่าตรวจสอบไฟล์ไม่ตรงกัน (ยกเลิกการอัปเดต)".into());
+        }
+    }
+
+    std::fs::write(&new, &buf).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&old);
+    if let Err(e) = std::fs::rename(&cur, &old) {
+        let _ = std::fs::remove_file(&new);
+        return Err(format!("สลับไฟล์ไม่สำเร็จ: {e}"));
+    }
+    if let Err(e) = std::fs::rename(&new, &cur) {
+        // พลาด: คืนไฟล์เดิมกลับ
+        let _ = std::fs::rename(&old, &cur);
+        return Err(format!("สลับไฟล์ไม่สำเร็จ: {e}"));
+    }
+    std::process::Command::new(&cur)
+        .spawn()
+        .map_err(|e| format!("เปิดเวอร์ชันใหม่ไม่ได้: {e}"))?;
+    Ok(())
 }
 
 // ---------- ฟอนต์ / สไตล์ ----------
@@ -336,6 +436,7 @@ enum Act {
     Del(String),
     DragStart(String),
     DragEnd,
+    Update,
 }
 
 #[derive(Default)]
@@ -360,6 +461,11 @@ struct App {
     info_done: HashSet<String>,
     dragging: Option<String>,
     row_rects: Vec<(String, egui::Rect)>,
+    update: Option<Update>,
+    updating: bool,
+    update_checked: bool,
+    utx: Sender<UpdMsg>,
+    urx: Receiver<UpdMsg>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     last_refresh: Instant,
@@ -386,6 +492,7 @@ fn display_name(s: &Server, st: Option<&Status>) -> String {
 impl App {
     fn new() -> Self {
         let (tx, rx) = channel();
+        let (utx, urx) = channel();
         Self {
             state: load_state(),
             status: HashMap::new(),
@@ -394,6 +501,11 @@ impl App {
             info_done: HashSet::new(),
             dragging: None,
             row_rects: Vec::new(),
+            update: None,
+            updating: false,
+            update_checked: false,
+            utx,
+            urx,
             tx,
             rx,
             last_refresh: Instant::now()
@@ -697,6 +809,27 @@ impl eframe::App for App {
         while let Ok(m) = self.rx.try_recv() {
             self.on_msg(ctx, m);
         }
+        // เช็คอัปเดตครั้งเดียวตอนเปิดโปรแกรม
+        if !self.update_checked {
+            self.update_checked = true;
+            let tx = self.utx.clone();
+            let c = ctx.clone();
+            std::thread::spawn(move || {
+                if let Some(u) = check_update() {
+                    let _ = tx.send(UpdMsg::Found(u));
+                    c.request_repaint();
+                }
+            });
+        }
+        while let Ok(m) = self.urx.try_recv() {
+            match m {
+                UpdMsg::Found(u) => self.update = Some(u),
+                UpdMsg::Failed(e) => {
+                    self.updating = false;
+                    self.say(format!("อัปเดตไม่สำเร็จ: {e}"));
+                }
+            }
+        }
         if self.last_refresh.elapsed() >= REFRESH_EVERY {
             self.refresh(ctx);
         }
@@ -734,8 +867,10 @@ impl eframe::App for App {
                     ui.vertical(|ui| {
                         ui.label(RichText::new("เซิร์ฟเวอร์").size(28.0).strong());
                         ui.label(
-                            RichText::new(format!("ออนไลน์ {online}/{total}  ·  ผู้เล่นรวม {players}"))
-                                .color(TEXT_DIM),
+                            RichText::new(format!(
+                                "ออนไลน์ {online}/{total}  ·  ผู้เล่นรวม {players}  ·  v{VERSION}"
+                            ))
+                            .color(TEXT_DIM),
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -749,6 +884,20 @@ impl eframe::App for App {
                         }
                         if ui.button("เปิด FiveM เฉยๆ").clicked() {
                             acts.push(Act::Launch);
+                        }
+                        if let Some(u) = &self.update {
+                            let label = if self.updating {
+                                "กำลังอัปเดต…".to_string()
+                            } else {
+                                format!("อัปเดตเป็น v{}", u.version)
+                            };
+                            let b = egui::Button::new(
+                                RichText::new(label).strong().color(Color32::WHITE),
+                            )
+                            .fill(GREEN.gamma_multiply(0.7));
+                            if ui.add_enabled(!self.updating, b).clicked() {
+                                acts.push(Act::Update);
+                            }
                         }
                     });
                 });
@@ -856,6 +1005,21 @@ impl eframe::App for App {
                     }
                 }
                 Act::Del(id) => self.confirm_del = Some(id),
+                Act::Update => {
+                    if let Some(u) = self.update.clone() {
+                        self.updating = true;
+                        self.say("กำลังโหลดเวอร์ชันใหม่…".to_string());
+                        let tx = self.utx.clone();
+                        let c = ctx.clone();
+                        std::thread::spawn(move || match apply_update(&u) {
+                            Ok(()) => std::process::exit(0),
+                            Err(e) => {
+                                let _ = tx.send(UpdMsg::Failed(e));
+                                c.request_repaint();
+                            }
+                        });
+                    }
+                }
                 Act::DragStart(id) => self.dragging = Some(id),
                 Act::DragEnd => {
                     if let Some(id) = self.dragging.take() {
@@ -1013,6 +1177,10 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result<()> {
+    // ลบไฟล์เวอร์ชันเก่าที่เหลือจากการอัปเดตรอบก่อน
+    if let Ok(p) = std::env::current_exe() {
+        let _ = std::fs::remove_file(p.with_extension("old"));
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([960.0, 680.0])
