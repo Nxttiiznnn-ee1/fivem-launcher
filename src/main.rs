@@ -3,12 +3,14 @@
 
 use eframe::egui::{self, pos2, vec2, Align, Align2, Color32, Pos2, RichText, Sense, Stroke};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
-const DEFAULT_ADDR: &str = "89.38.101.183:30120";
+// เซิร์ฟเวอร์เริ่มต้น (ใช้ตอนเปิดโปรแกรมครั้งแรกที่ยังไม่มีไฟล์ servers.json)
+// เพิ่มได้โดยใส่ที่อยู่ต่อท้ายในวงเล็บเหลี่ยม คั่นด้วยเครื่องหมายคอมมา
+const DEFAULT_SERVERS: &[&str] = &["89.38.101.183:30120"];
 const REFRESH_EVERY: Duration = Duration::from_secs(30);
 
 const BG: Color32 = Color32::from_rgb(10, 12, 22);
@@ -32,6 +34,9 @@ struct Server {
     address: String,
     #[serde(default)]
     fav: bool,
+    // เลข game build ที่บังคับใช้ (เว้นว่าง = ตรวจจากเซิร์ฟเวอร์อัตโนมัติ)
+    #[serde(default)]
+    build: String,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -56,12 +61,15 @@ fn load_state() -> State {
     match parsed {
         Some(s) => s,
         None => State {
-            servers: vec![Server {
-                id: "default1".into(),
-                name: String::new(),
-                address: DEFAULT_ADDR.into(),
-                fav: false,
-            }],
+            servers: DEFAULT_SERVERS
+                .iter()
+                .enumerate()
+                .map(|(i, a)| Server {
+                    id: format!("default{}", i + 1),
+                    address: a.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
             last: None,
         },
     }
@@ -118,6 +126,10 @@ struct Status {
     max: Option<u64>,
     ping: u32,
     icon: Option<IconData>,
+    // เลข game build ที่เซิร์ฟเวอร์บังคับ (sv_enforceGameBuild) ถ้ามี
+    build: Option<String>,
+    // true = อ่าน info.json ได้แล้ว ไม่ต้องโหลดซ้ำทุกรอบ
+    info_ok: bool,
 }
 
 fn offline() -> Status {
@@ -128,6 +140,8 @@ fn offline() -> Status {
         max: None,
         ping: 0,
         icon: None,
+        build: None,
+        info_ok: false,
     }
 }
 
@@ -161,7 +175,7 @@ fn decode_icon(b64: &str) -> Option<IconData> {
     })
 }
 
-fn fetch_status(address: &str, want_icon: bool) -> Status {
+fn fetch_status(address: &str, want_info: bool) -> Status {
     if address.contains("cfx.re/join/") {
         let code = address.rsplit('/').next().unwrap_or("");
         let url = format!("https://servers-frontend.fivem.net/api/servers/single/{code}");
@@ -174,7 +188,11 @@ fn fetch_status(address: &str, want_icon: bool) -> Status {
                     players: num(&d["clients"]),
                     max: num(&d["sv_maxclients"]),
                     ping: ms,
-                    icon: None,
+                    build: d["vars"]["sv_enforceGameBuild"]
+                        .as_str()
+                        .map(|s| s.to_string()),
+                    info_ok: true,
+                    ..offline()
                 }
             }
             None => offline(),
@@ -188,11 +206,19 @@ fn fetch_status(address: &str, want_icon: bool) -> Status {
     };
 
     if let Some((v, ms)) = get_json(&format!("http://{host}/dynamic.json"), 3) {
-        let icon = if want_icon {
-            get_json(&format!("http://{host}/info.json"), 3)
-                .and_then(|(i, _)| i["icon"].as_str().and_then(decode_icon))
+        let (icon, build, info_ok) = if want_info {
+            match get_json(&format!("http://{host}/info.json"), 3) {
+                Some((i, _)) => (
+                    i["icon"].as_str().and_then(decode_icon),
+                    i["vars"]["sv_enforceGameBuild"]
+                        .as_str()
+                        .map(|s| s.to_string()),
+                    true,
+                ),
+                None => (None, None, false),
+            }
         } else {
-            None
+            (None, None, false)
         };
         return Status {
             online: true,
@@ -201,6 +227,8 @@ fn fetch_status(address: &str, want_icon: bool) -> Status {
             max: num(&v["sv_maxclients"]),
             ping: ms,
             icon,
+            build,
+            info_ok,
         };
     }
 
@@ -211,11 +239,8 @@ fn fetch_status(address: &str, want_icon: bool) -> Status {
         if std::net::TcpStream::connect_timeout(&sa, Duration::from_secs(3)).is_ok() {
             return Status {
                 online: true,
-                name: String::new(),
-                players: None,
-                max: None,
                 ping: t.elapsed().as_millis() as u32,
-                icon: None,
+                ..offline()
             };
         }
     }
@@ -237,20 +262,41 @@ fn open_url(u: &str) {
     let _ = std::process::Command::new("xdg-open").arg(u).spawn();
 }
 
+fn fivem_exe() -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")?;
+    let exe = PathBuf::from(base).join("FiveM").join("FiveM.exe");
+    exe.exists().then_some(exe)
+}
+
+fn run_fivem(args: &[String]) -> bool {
+    let Some(exe) = fivem_exe() else {
+        return false;
+    };
+    let mut c = std::process::Command::new(&exe);
+    if let Some(dir) = exe.parent() {
+        c.current_dir(dir);
+    }
+    c.args(args).spawn().is_ok()
+}
+
 fn launch_fivem() {
-    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
-        let exe = PathBuf::from(base).join("FiveM").join("FiveM.exe");
-        if exe.exists() {
-            let mut c = std::process::Command::new(&exe);
-            if let Some(dir) = exe.parent() {
-                c.current_dir(dir);
-            }
-            if c.spawn().is_ok() {
-                return;
-            }
+    if !run_fivem(&[]) {
+        open_url("fivem://");
+    }
+}
+
+// เปิดเกมเข้าเซิร์ฟเวอร์ ถ้ามีเลข build จะส่ง -b<เลข> ให้ FiveM เปิดด้วย build นั้นตั้งแต่แรก
+// (ได้ผลเฉพาะตอนที่ FiveM ยังไม่ได้เปิดอยู่)
+fn connect_game(addr: &str, build: Option<&str>) {
+    let url = format!("fivem://connect/{addr}");
+    let valid =
+        build.filter(|b| (3..=5).contains(&b.len()) && b.chars().all(|c| c.is_ascii_digit()));
+    if let Some(b) = valid {
+        if run_fivem(&[format!("-b{b}"), url.clone()]) {
+            return;
         }
     }
-    open_url("fivem://");
+    open_url(&url);
 }
 
 // ---------- ฟอนต์ / สไตล์ ----------
@@ -305,6 +351,8 @@ enum Act {
     Fav(String),
     Edit(String),
     Del(String),
+    DragStart(String),
+    DragEnd,
 }
 
 #[derive(Default)]
@@ -312,6 +360,7 @@ struct Editor {
     id: Option<String>,
     name: String,
     address: String,
+    build: String,
     error: String,
 }
 
@@ -324,6 +373,10 @@ struct App {
     state: State,
     status: HashMap<String, Status>,
     icons: HashMap<String, egui::TextureHandle>,
+    builds: HashMap<String, String>,
+    info_done: HashSet<String>,
+    dragging: Option<String>,
+    row_rects: Vec<(String, egui::Rect)>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     last_refresh: Instant,
@@ -354,6 +407,10 @@ impl App {
             state: load_state(),
             status: HashMap::new(),
             icons: HashMap::new(),
+            builds: HashMap::new(),
+            info_done: HashSet::new(),
+            dragging: None,
+            row_rects: Vec::new(),
             tx,
             rx,
             last_refresh: Instant::now()
@@ -373,12 +430,12 @@ impl App {
             let Some(addr) = normalize(&s.address) else {
                 continue;
             };
-            let want_icon = !self.icons.contains_key(&s.id);
+            let want_info = !self.info_done.contains(&s.id);
             let tx = self.tx.clone();
             let id = s.id.clone();
             let ctx = ctx.clone();
             std::thread::spawn(move || {
-                let status = fetch_status(&addr, want_icon);
+                let status = fetch_status(&addr, want_info);
                 let _ = tx.send(Msg { id, status });
                 ctx.request_repaint();
             });
@@ -387,6 +444,12 @@ impl App {
 
     fn on_msg(&mut self, ctx: &egui::Context, m: Msg) {
         let mut st = m.status;
+        if st.info_ok {
+            self.info_done.insert(m.id.clone());
+        }
+        if let Some(b) = st.build.take() {
+            self.builds.insert(m.id.clone(), b);
+        }
         if let Some(ic) = st.icon.take() {
             let img = egui::ColorImage::from_rgba_unmultiplied([ic.w, ic.h], &ic.rgba);
             let tex = ctx.load_texture(format!("icon-{}", m.id), img, egui::TextureOptions::LINEAR);
@@ -419,20 +482,51 @@ impl App {
         self.toast = Some((msg, Instant::now()));
     }
 
+    // เลข build ที่จะใช้: ที่ตั้งเองมาก่อน ถ้าไม่ได้ตั้งใช้ค่าที่ตรวจเจอจากเซิร์ฟเวอร์
+    fn effective_build(&self, s: &Server) -> Option<String> {
+        if !s.build.is_empty() {
+            Some(s.build.clone())
+        } else {
+            self.builds.get(&s.id).cloned()
+        }
+    }
+
+    // ย้ายแถวไปตำแหน่งที่ปล่อยเมาส์ (y = ตำแหน่งแนวตั้งของเมาส์)
+    fn reorder(&mut self, id: &str, y: f32) {
+        let Some(from) = self.state.servers.iter().position(|s| s.id == id) else {
+            return;
+        };
+        let target = self
+            .row_rects
+            .iter()
+            .filter(|(rid, r)| rid != id && r.center().y < y)
+            .count();
+        let s = self.state.servers.remove(from);
+        let at = target.min(self.state.servers.len());
+        self.state.servers.insert(at, s);
+        save_state(&self.state);
+    }
+
     fn connect(&mut self, id: &str) {
         let found = self.state.servers.iter().find(|s| s.id == id).map(|s| {
             (
                 normalize(&s.address),
                 display_name(s, self.status.get(&s.id)),
+                self.effective_build(s),
             )
         });
-        let Some((addr, name)) = found else { return };
+        let Some((addr, name, build)) = found else {
+            return;
+        };
         match addr {
             Some(a) => {
-                open_url(&format!("fivem://connect/{a}"));
+                connect_game(&a, build.as_deref());
                 self.state.last = Some(id.to_string());
                 save_state(&self.state);
-                self.say(format!("กำลังเปิด FiveM → {name}"));
+                self.say(match &build {
+                    Some(b) => format!("กำลังเปิด FiveM (build {b}) → {name}"),
+                    None => format!("กำลังเปิด FiveM → {name}"),
+                });
             }
             None => self.say("ที่อยู่เซิร์ฟเวอร์ไม่ถูกต้อง".to_string()),
         }
@@ -481,9 +575,12 @@ fn draw_row(
     st: Option<&Status>,
     icon: Option<&egui::TextureHandle>,
     name: &str,
+    build: Option<&str>,
+    can_drag: bool,
+    rects: &mut Vec<(String, egui::Rect)>,
     acts: &mut Vec<Act>,
 ) {
-    egui::Frame::none()
+    let framed = egui::Frame::none()
         .fill(ROW)
         .stroke(Stroke::new(1.0, ROW_LINE))
         .rounding(14.0)
@@ -491,6 +588,32 @@ fn draw_row(
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
+                // ที่จับสำหรับลากสลับลำดับ (เปิดใช้เมื่อไม่ได้ค้นหา/กรองอยู่)
+                if can_drag {
+                    let (hr, hresp) = ui.allocate_exact_size(vec2(14.0, 52.0), Sense::drag());
+                    let col = if hresp.hovered() || hresp.dragged() {
+                        TEXT_DIM
+                    } else {
+                        Color32::from_rgb(70, 75, 100)
+                    };
+                    for dx in [-3.0f32, 3.0] {
+                        for dy in [-8.0f32, 0.0, 8.0] {
+                            ui.painter()
+                                .circle_filled(hr.center() + vec2(dx, dy), 1.6, col);
+                        }
+                    }
+                    if hresp.dragged() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                    } else if hresp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                    }
+                    if hresp.drag_started() {
+                        acts.push(Act::DragStart(s.id.clone()));
+                    }
+                    if hresp.drag_stopped() {
+                        acts.push(Act::DragEnd);
+                    }
+                }
                 // ไอคอน + จุดสถานะ
                 let (rect, _) = ui.allocate_exact_size(vec2(52.0, 52.0), Sense::hover());
                 match icon {
@@ -527,7 +650,16 @@ fn draw_row(
 
                 // ชื่อ + แถบจำนวนผู้เล่น
                 ui.vertical(|ui| {
-                    ui.label(RichText::new(name).size(17.0).strong());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(name).size(17.0).strong());
+                        if let Some(b) = build {
+                            ui.label(
+                                RichText::new(format!("build {b}"))
+                                    .size(12.0)
+                                    .color(TEXT_DIM),
+                            );
+                        }
+                    });
                     let frac = match st {
                         Some(x) => match (x.players, x.max) {
                             (Some(p), Some(m)) if m > 0 => p as f32 / m as f32,
@@ -587,6 +719,7 @@ fn draw_row(
                 });
             });
         });
+    rects.push((s.id.clone(), framed.response.rect));
 }
 
 impl eframe::App for App {
@@ -601,6 +734,8 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_secs(5));
 
         let mut acts: Vec<Act> = Vec::new();
+        let mut new_rects: Vec<(String, egui::Rect)> = Vec::new();
+        let can_drag = self.filter == Filter::All && self.query.trim().is_empty();
         let visible = self.visible();
         let total = self.state.servers.len();
         let online = self
@@ -675,10 +810,57 @@ impl eframe::App for App {
                         for s in &visible {
                             let st = self.status.get(&s.id);
                             let name = display_name(s, st);
-                            draw_row(ui, s, st, self.icons.get(&s.id), &name, &mut acts);
+                            let build = if !s.build.is_empty() {
+                                Some(s.build.as_str())
+                            } else {
+                                self.builds.get(&s.id).map(|b| b.as_str())
+                            };
+                            draw_row(
+                                ui,
+                                s,
+                                st,
+                                self.icons.get(&s.id),
+                                &name,
+                                build,
+                                can_drag,
+                                &mut new_rects,
+                                &mut acts,
+                            );
+                        }
+
+                        // เส้นบอกตำแหน่งที่จะวางแถว ระหว่างกำลังลาก
+                        if let Some(dragged) = self.dragging.as_deref() {
+                            if let Some(pos) = ui.ctx().input(|i| i.pointer.latest_pos()) {
+                                let others: Vec<&egui::Rect> = self
+                                    .row_rects
+                                    .iter()
+                                    .filter(|(rid, _)| rid.as_str() != dragged)
+                                    .map(|(_, r)| r)
+                                    .collect();
+                                if !others.is_empty() {
+                                    let target =
+                                        others.iter().filter(|r| r.center().y < pos.y).count();
+                                    let y = if target == 0 {
+                                        others[0].top() - 5.0
+                                    } else {
+                                        others[target - 1].bottom() + 5.0
+                                    };
+                                    ui.ctx()
+                                        .layer_painter(egui::LayerId::new(
+                                            egui::Order::Foreground,
+                                            egui::Id::new("dropline"),
+                                        ))
+                                        .hline(
+                                            egui::Rangef::new(others[0].left(), others[0].right()),
+                                            y,
+                                            Stroke::new(3.0, ACCENT),
+                                        );
+                                }
+                            }
                         }
                     });
             });
+        self.row_rects = new_rects;
 
         for a in acts {
             match a {
@@ -698,12 +880,25 @@ impl eframe::App for App {
                             id: Some(id.clone()),
                             name: s.name.clone(),
                             address: s.address.clone(),
+                            build: s.build.clone(),
                             error: String::new(),
                         });
                     }
                 }
                 Act::Del(id) => self.confirm_del = Some(id),
+                Act::DragStart(id) => self.dragging = Some(id),
+                Act::DragEnd => {
+                    if let Some(id) = self.dragging.take() {
+                        if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
+                            self.reorder(&id, pos.y);
+                        }
+                    }
+                }
             }
+        }
+        // กันค้างในโหมดลาก ถ้าปล่อยเมาส์ไปแล้วแต่ยังไม่ได้เคลียร์
+        if self.dragging.is_some() && !ctx.input(|i| i.pointer.any_down()) {
+            self.dragging = None;
         }
 
         // หน้าต่างเพิ่ม/แก้ไข
@@ -724,6 +919,12 @@ impl eframe::App for App {
                     ui.add(egui::TextEdit::singleline(&mut ed.name).desired_width(340.0));
                     ui.label("IP:Port หรือ cfx.re/join/โค้ด");
                     ui.add(egui::TextEdit::singleline(&mut ed.address).desired_width(340.0));
+                    ui.label("Game build (ไม่บังคับ เว้นว่าง = ตรวจจากเซิร์ฟเวอร์อัตโนมัติ)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut ed.build)
+                            .hint_text("เช่น 2944")
+                            .desired_width(340.0),
+                    );
                     if !ed.error.is_empty() {
                         ui.colored_label(RED, &ed.error);
                     }
@@ -736,7 +937,12 @@ impl eframe::App for App {
                         }
                     });
                 });
-            if save {
+            let build = ed.build.trim().to_string();
+            let build_ok = build.is_empty()
+                || ((3..=5).contains(&build.len()) && build.chars().all(|c| c.is_ascii_digit()));
+            if save && !build_ok {
+                ed.error = "เลข build ต้องเป็นตัวเลข 3–5 หลัก เช่น 2944".into();
+            } else if save {
                 match normalize(&ed.address) {
                     Some(addr) => {
                         let name = ed.name.trim().to_string();
@@ -746,6 +952,7 @@ impl eframe::App for App {
                                 {
                                     s.name = name;
                                     s.address = addr;
+                                    s.build = build;
                                 }
                             }
                             None => {
@@ -758,6 +965,7 @@ impl eframe::App for App {
                                     name,
                                     address: addr,
                                     fav: false,
+                                    build,
                                 });
                             }
                         }
