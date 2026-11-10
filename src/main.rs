@@ -30,6 +30,16 @@ const AMBER: Color32 = Color32::from_rgb(245, 179, 1);
 const RED: Color32 = Color32::from_rgb(239, 68, 68);
 const GOLD: Color32 = Color32::from_rgb(250, 190, 40);
 
+// สีประจำ game build (build เดียวกันได้สีเดียวกัน = สลับเซิร์ฟเวอร์กันได้โดยไม่ต้องรีสตาร์ท)
+const BUILD_COLORS: [Color32; 6] = [
+    Color32::from_rgb(96, 165, 250),
+    Color32::from_rgb(74, 222, 128),
+    Color32::from_rgb(251, 191, 36),
+    Color32::from_rgb(244, 114, 182),
+    Color32::from_rgb(45, 212, 191),
+    Color32::from_rgb(167, 139, 250),
+];
+
 // ---------- ข้อมูล ----------
 #[derive(Serialize, Deserialize, Clone, Default)]
 struct Server {
@@ -593,22 +603,41 @@ impl App {
         save_state(&self.state);
     }
 
+    // เลข build ของเซิร์ฟเวอร์: ที่ตรวจเจอจากเซิร์ฟเวอร์ (หรือที่เคยตั้งไว้เองในไฟล์)
+    fn build_of(&self, s: &Server) -> Option<String> {
+        if !s.build.is_empty() {
+            Some(s.build.clone())
+        } else {
+            self.builds.get(&s.id).cloned()
+        }
+    }
+
     fn connect(&mut self, id: &str) {
-        let found = self.state.servers.iter().find(|s| s.id == id).map(|s| {
-            (
-                normalize(&s.address),
-                display_name(s, self.status.get(&s.id)),
-            )
-        });
-        let Some((addr, name)) = found else {
+        let Some(s) = self.state.servers.iter().find(|s| s.id == id) else {
             return;
         };
+        let addr = normalize(&s.address);
+        let name = display_name(s, self.status.get(&s.id));
+        let target_build = self.build_of(s);
+        // build ของเซิร์ฟเวอร์ล่าสุดที่เข้าผ่าน launcher นี้
+        let last_build = self
+            .state
+            .last
+            .as_ref()
+            .and_then(|lid| self.state.servers.iter().find(|x| &x.id == lid))
+            .and_then(|x| self.build_of(x));
         match addr {
             Some(a) => {
                 connect_game(&a);
                 self.state.last = Some(id.to_string());
                 save_state(&self.state);
-                self.say(format!("กำลังเปิด FiveM → {name}"));
+                let msg = match (&last_build, &target_build) {
+                    (Some(l), Some(t)) if l != t => {
+                        format!("กำลังเปิด FiveM → {name}  ·  build {l} → {t} FiveM จะรีสตาร์ท")
+                    }
+                    _ => format!("กำลังเปิด FiveM → {name}"),
+                };
+                self.say(msg);
             }
             None => self.say("ที่อยู่เซิร์ฟเวอร์ไม่ถูกต้อง".to_string()),
         }
@@ -657,7 +686,7 @@ fn draw_row(
     st: Option<&Status>,
     icon: Option<&egui::TextureHandle>,
     name: &str,
-    build: Option<&str>,
+    build: Option<(&str, Color32)>,
     can_drag: bool,
     rects: &mut Vec<(String, egui::Rect)>,
     acts: &mut Vec<Act>,
@@ -734,12 +763,19 @@ fn draw_row(
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(name).size(17.0).strong());
-                        if let Some(b) = build {
-                            ui.label(
-                                RichText::new(format!("build {b}"))
-                                    .size(12.0)
-                                    .color(TEXT_DIM),
-                            );
+                        if let Some((b, col)) = build {
+                            egui::Frame::none()
+                                .fill(col.gamma_multiply(0.2))
+                                .rounding(8.0)
+                                .inner_margin(egui::Margin::symmetric(8.0, 2.0))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(format!("build {b}"))
+                                            .size(12.0)
+                                            .strong()
+                                            .color(col),
+                                    );
+                                });
                         }
                     });
                     let frac = match st {
@@ -836,6 +872,26 @@ impl eframe::App for App {
         // ตื่นมาเช็คเวลาทุก 5 วินาทีเท่านั้น ที่เหลือหลับ (ประหยัด CPU/แบต)
         ctx.request_repaint_after(Duration::from_secs(5));
 
+        // แต่ละ build ได้สีประจำตัว (เรียงตามเลข build ให้สีคงที่)
+        let mut distinct: Vec<String> = self
+            .state
+            .servers
+            .iter()
+            .filter_map(|s| self.build_of(s))
+            .collect();
+        distinct.sort();
+        distinct.dedup();
+        let build_info: HashMap<String, (String, Color32)> = self
+            .state
+            .servers
+            .iter()
+            .filter_map(|s| {
+                let b = self.build_of(s)?;
+                let idx = distinct.iter().position(|d| *d == b)?;
+                Some((s.id.clone(), (b, BUILD_COLORS[idx % BUILD_COLORS.len()])))
+            })
+            .collect();
+
         let mut acts: Vec<Act> = Vec::new();
         let mut new_rects: Vec<(String, egui::Rect)> = Vec::new();
         let can_drag = self.filter == Filter::All && self.query.trim().is_empty();
@@ -929,11 +985,7 @@ impl eframe::App for App {
                         for s in &visible {
                             let st = self.status.get(&s.id);
                             let name = display_name(s, st);
-                            let build = if !s.build.is_empty() {
-                                Some(s.build.as_str())
-                            } else {
-                                self.builds.get(&s.id).map(|b| b.as_str())
-                            };
+                            let build = build_info.get(&s.id).map(|(b, c)| (b.as_str(), *c));
                             draw_row(
                                 ui,
                                 s,
@@ -1154,7 +1206,7 @@ impl eframe::App for App {
         let expired = self
             .toast
             .as_ref()
-            .map_or(false, |(_, t)| t.elapsed() > Duration::from_secs(3));
+            .map_or(false, |(_, t)| t.elapsed() > Duration::from_secs(5));
         if expired {
             self.toast = None;
         }
